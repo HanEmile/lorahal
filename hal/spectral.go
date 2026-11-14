@@ -82,8 +82,10 @@ func (h *Hal) retuneSX125x(rfChain uint8, freqHz uint32) error {
 		}
 	}
 	for attempt := 1; ; attempt++ {
-		if attempt > pllLockMaxAttempts {
-			return fmt.Errorf("sx125x %d: fail to lock PLL", rfChain)
+		// band-edge bins (PMR domains around 862 MHz) lock significantly
+		// slower than mid-band; give them time instead of failing the bin.
+		if attempt > 3*pllLockMaxAttempts {
+			return fmt.Errorf("sx125x %d: fail to lock PLL after %d attempts", rfChain, 3*pllLockMaxAttempts)
 		}
 		if err := h.sx125xWrite(rfChain, 0x00, 1); err != nil {
 			return err
@@ -91,7 +93,7 @@ func (h *Hal) retuneSX125x(rfChain uint8, freqHz uint32) error {
 		if err := h.sx125xWrite(rfChain, 0x00, 3); err != nil {
 			return err
 		}
-		waitMs(1)
+		waitMs(1 + attempt)
 		v, err := h.sx125xRead(rfChain, 0x11)
 		if err != nil {
 			return err
@@ -148,7 +150,21 @@ func (h *Hal) SpectralScan(rfChain uint8, bins []uint32) ([]SpectralPoint, error
 		return nil, err
 	}
 	restoreFreq := h.rfRxFreq[rfChain]
+
+	// The AGC MCU owns the radio SPI bus while the concentrator runs (the
+	// start sequence clears FORCE_HOST_RADIO_CTRL). Host-side radio writes
+	// like the sweeps below silently lose against the MCU — e.g. mid-speed
+	// polarization glitches leading to PLL lock failures. Take the bus back
+	// for the scan duration and hand it back on return.
+	if err := h.RegW(LGW_FORCE_HOST_RADIO_CTRL, 1); err != nil {
+		return nil, err
+	}
+	if err := h.RegW(LGW_FORCE_HOST_FE_CTRL, 1); err != nil {
+		return nil, err
+	}
 	defer func() {
+		h.RegW(LGW_FORCE_HOST_RADIO_CTRL, 0)
+		h.RegW(LGW_FORCE_HOST_FE_CTRL, 0)
 		h.RegW(LGW_CHANN_SELECT_RSSI, oldSelect)
 		// best effort: radio back to its configured RX center
 		if restoreFreq != 0 {
